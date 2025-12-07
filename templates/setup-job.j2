@@ -1,0 +1,75 @@
+{% if security.mode == 'strict' %}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ndn-setup-job
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      serviceAccountName: ndn-setup-sa
+      containers:
+      - name: key-generator
+        image: icekarinn/ndn-all:v1.0
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "=== Starting NDN Certificate Chain Generation ==="
+
+          #kubectlのインストール
+          apt-get update && apt-get install -y curl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+
+          mkdir -p /work/keys
+          export HOME=/root
+
+          ROOT_PREFIX="/ndn"
+          SITE_PREFIX="{{ network_prefix }}"
+          OP_PREFIX="{{ network_prefix }}/%C1.Operator/op"
+
+          echo "--- 1. Root CA Generation ---"
+          ndnsec key-gen $ROOT_PREFIX > root.key
+          ndnsec cert-dump -i $ROOT_PREFIX > /work/keys/root.cert
+          ndnsec cert-install -f /work/keys/root.cert
+
+          echo "--- 2. Site CA Generation (Root signed) ---"
+          ndnsec key-gen $SITE_PREFIX > site.key
+          ndnsec cert-gen -s $ROOT_PREFIX site.key > /work/keys/site.cert
+          ndnsec cert-install -f /work/keys/site.cert
+
+          echo "--- 3. Operator CA Generation (Site signed) ---"
+          ndnsec key-gen $OP_PREFIX > op.key
+          ndnsec cert-gen -s $SITE_PREFIX op.key > /work/keys/op.cert
+          ndnsec cert-install -f /work/keys/op.cert
+
+          kubectl delete secret ndn-trust-anchor --ignore-not-found
+          kubectl create secret generic ndn-trust-anchor \
+            --from-file=/work/keys/root.cert \
+            --from-file=/work/keys/site.cert \
+            --from-file=/work/keys/op.cert
+
+          echo "--- 4. Router Keys Generation (Op signed) ---"
+          {% for node in nodes %}
+          NODE_NAME="{{ node.name }}"
+          ROUTER_PREFIX="{{ network_prefix }}/{{ site_name }}/%C1.Router/$NODE_NAME"
+
+          echo "Processing $NODE_NAME ..."
+          ndnsec key-gen $ROUTER_PREFIX > $NODE_NAME.key
+          ndnsec cert-gen -s $OP_PREFIX $NODE_NAME.key > /work/keys/$NODE_NAME.cert
+          ndnsec cert-install -f /work/keys/$NODE_NAME.cert
+
+          ndnsec export -o /work/keys/$NODE_NAME.p12 -i $ROUTER_PREFIX -P password
+
+          SECRET_NAME="sec-$NODE_NAME"
+          kubectl delete secret $SECRET_NAME --ignore-not-found
+          kubectl create secret generic $SECRET_NAME \
+            --from-file=identity.p12=/work/keys/$NODE_NAME.p12
+
+          {% endfor %}
+
+          echo "=== All Done. Secrets created. ==="
+      restartPolicy: Never
+{% endif %}

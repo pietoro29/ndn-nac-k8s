@@ -3,27 +3,28 @@ general
   network {{ network_prefix }}
   site {{ site_name }}
   router /%C1.Router/{{ node_name }}
-  log-level INFO
+
   lsa-refresh-time 1800
   lsa-interest-lifetime 4
   sync-protocol psync
   sync-interest-lifetime 60000
-  state-dir /var/lib/nlsr/
+  state-dir       /var/lib/nlsr
 }
 
 neighbors
 {
-  hello-retries 3
-  hello-timeout 1
-  hello-interval 60
+   hello-retries 3
+   hello-timeout 1
+   hello-interval  60
   adj-lsa-build-interval 10
+
   face-dataset-fetch-tries 3
   face-dataset-fetch-interval 3600
 {% for neighbor in neighbors %}
   neighbor
   {
     name {{ network_prefix }}/{{ site_name }}/%C1.Router/{{ neighbor.name }}
-    face-uri tcp://{{ neighbor.name }}
+    face-uri "tcp://{{ neighbor.name }}"
     link-cost {{ neighbor.cost }}
   }
 {% endfor %}
@@ -36,6 +37,12 @@ hyperbolic
   angle    1.45,2.36
 }
 
+fib
+{
+  max-faces-per-prefix 3
+  routing-calc-interval 15
+}
+
 advertising
 {
   prefix {{ network_prefix }}/{{ site_name }}/{{ node_name }}
@@ -45,16 +52,202 @@ security
 {
   validator
   {
+    rule
+    {
+      id "NLSR Hello Rule"
+      for data
+      filter
+      {
+        type name
+        regex ^[^<nlsr><INFO>]*<nlsr><INFO><><>$
+      }
+      checker
+      {
+        type customized
+        sig-type ecdsa-sha256
+        key-locator
+        {
+          type name
+          hyper-relation
+          {
+            k-regex ^([^<KEY><nlsr>]*)<nlsr><KEY><>{1,3}$
+            k-expand \\1
+            h-relation equal
+            p-regex ^([^<nlsr><INFO>]*)<nlsr><INFO><><>$
+            p-expand \\1
+          }
+        }
+      }
+    }
+
+    rule
+    {
+      id "NLSR LSA Rule"
+      for data
+      filter
+      {
+        type name
+        regex ^[^<nlsr><LSA>]*<nlsr><LSA>
+      }
+      checker
+      {
+        type customized
+        sig-type ecdsa-sha256
+        key-locator
+        {
+          type name
+          hyper-relation
+          {
+            k-regex ^([^<KEY><nlsr>]*)<nlsr><KEY><>{1,3}$
+            k-expand \\1
+            h-relation equal
+            ; the last four components in the prefix should be <lsaType><seqNo><version><segmentNo>
+            p-regex ^<localhop>([^<nlsr><LSA>]*)<nlsr><LSA>(<>*)<><><><>$
+            p-expand \\1\\2
+          }
+        }
+      }
+    }
+
+    rule
+    {
+      id "NLSR datasets"
+      for data
+      filter
+      {
+        type name
+        regex ^[^<nlsr>]*<nlsr>[<lsdb><routing-table>]
+      }
+      checker
+      {
+        type customized
+        sig-type ecdsa-sha256
+        key-locator
+        {
+          type name
+          hyper-relation
+          {
+            k-regex ^([^<KEY>]*)<KEY><>{1,3}$ ; router key or certificate
+            k-expand \\1
+            h-relation equal
+            p-regex ^([^<nlsr>]*)<nlsr>[<lsdb><routing-table>]
+            p-expand \\1
+          }
+        }
+      }
+    }
+
+    rule
+    {
+      id "NLSR Hierarchy Exception Rule"
+      for data
+      filter
+      {
+        type name
+        regex ^[^<KEY><%C1.Router>]*<%C1.Router>[^<KEY><nlsr>]*<KEY><><><>$
+      }
+      checker
+      {
+        type customized
+        sig-type ecdsa-sha256
+        key-locator
+        {
+          type name
+          hyper-relation
+          {
+            k-regex ^([^<KEY><%C1.Operator>]*)<%C1.Operator>[^<KEY>]*<KEY><>{1,3}$
+            k-expand \\1
+            h-relation equal
+            p-regex ^([^<KEY><%C1.Router>]*)<%C1.Router>[^<KEY>]*<KEY><><><>$
+            p-expand \\1
+          }
+        }
+      }
+    }
+
+    rule
+    {
+      id "NLSR Hierarchical Rule"
+      for data
+      filter
+      {
+        type name
+        regex ^[^<KEY>]*<KEY><><><>$
+      }
+      checker
+      {
+        type hierarchical
+        sig-type ecdsa-sha256
+      }
+    }
+
     trust-anchor
     {
+      {% if security.mode == 'strict' %}
+      type file
+      file-name /etc/trust-anchor/root.cert
+      {% else %}
       type any
+      {% endif %}
     }
   }
+
   prefix-update-validator
   {
+    rule
+    {
+      id "NLSR ControlCommand Rule"
+      for interest
+      filter
+      {
+        type name
+        regex ^<localhost><nlsr><prefix-update>[<advertise><withdraw>]<><><>$
+      }
+      checker
+      {
+        type customized
+        sig-type ecdsa-sha256
+        key-locator
+        {
+          type name
+          regex ^([^<KEY><%C1.Operator>]*)<%C1.Operator>[^<KEY>]*<KEY><>{1,3}$
+        }
+      }
+    }
+
+    rule
+    {
+      id "NLSR Hierarchy Rule"
+      for data
+      filter
+      {
+        type name
+        regex ^[^<KEY>]*<KEY><><><>$
+      }
+      checker
+      {
+        type hierarchical
+        sig-type ecdsa-sha256
+      }
+    }
+
     trust-anchor
     {
+      {% if security.mode == 'strict' %}
+      type file
+      file-name /etc/trust-anchor/site.cert
+      {% else %}
       type any
+      {% endif %}
     }
   }
+
+  {% if security.mode == 'strict' %}
+  cert-to-publish "router.cert"
+  {% if node.get('role') == 'gateway' %}
+  cert-to-publish "/etc/trust-anchor/root.cert"
+  cert-to-publish "/etc/trust-anchor/site.cert"
+  cert-to-publish "/etc/trust-anchor/op.cert"
+  {% endif %}
+  {% endif %}
 }

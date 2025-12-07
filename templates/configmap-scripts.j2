@@ -20,17 +20,30 @@ data:
     mkdir -p /run/nfd
     export HOME=/root
 
-    # 自己署名証明書の作成 (Router用)
-    # ※ NLSR設定内の router prefix と一致させる必要がある
-    NETWORK_PREFIX="{{ config.network_prefix }}"
-    SITE_NAME="{{ config.site_name }}"
-    FULL_PREFIX="${NETWORK_PREFIX}/${SITE_NAME}"
-    ROUTER_PREFIX="${FULL_PREFIX}/%C1.Router/${NODE_NAME}"
+    if [ "$SECURITY_MODE" == "strict" ]; then
+        echo "--- [Strict] Importing Identity from Secret ---"
+        if [ ! -f /etc/secret/identity.p12 ]; then
+            echo "Error: Identity file not found. Setup Job might be running."
+            exit 1
+        fi
+        ndnsec import -P password /etc/secret/identity.p12
 
-    echo "Generating Keys for: ${ROUTER_PREFIX}"
-    ndnsec key-gen "${ROUTER_PREFIX}" | ndnsec cert-install -
-    ndnsec set-default "${ROUTER_PREFIX}"
-    ndnsec cert-dump -i "${ROUTER_PREFIX}" > /etc/nlsr/router.cert
+        NETWORK_PREFIX="{{ config.network_prefix }}"
+        SITE_NAME="{{ config.site_name }}"
+        ROUTER_PREFIX="${NETWORK_PREFIX}/${SITE_NAME}/%C1.Router/${NODE_NAME}"
+        ndnsec set-default "$ROUTER_PREFIX"
+        ndnsec cert-dump -i "$ROUTER_PREFIX" > /etc/nlsr/router.cert
+
+    else
+        echo "--- [Lax] Generating Self-Signed Identity ---"
+        NETWORK_PREFIX="{{ config.network_prefix }}"
+        SITE_NAME="{{ config.site_name }}"
+        ROUTER_PREFIX="${NETWORK_PREFIX}/${SITE_NAME}/%C1.Router/${NODE_NAME}"
+
+        ndnsec key-gen "$ROUTER_PREFIX" | ndnsec cert-install -
+        ndnsec set-default "$ROUTER_PREFIX"
+        ndnsec cert-dump -i "$ROUTER_PREFIX" > /etc/nlsr/router.cert
+    fi
 
     echo "--- Starting NFD ---"
     nfd-start > /var/log/nfd.log 2>&1 &
@@ -42,8 +55,15 @@ data:
     for neighbor_pair in "${ADDR[@]}"; do
         neighbor_host="${neighbor_pair%%:*}"
         if [ ! -z "$neighbor_host" ]; then
-            echo "Creating face to ${neighbor_host}..."
-            nfdc face create tcp://${neighbor_host} || true
+            echo "Attempting to connect to ${neighbor_host}..."
+            for i in {1..15}; do
+                if nfdc face create tcp://${neighbor_host}; then
+                    echo "Success: Connected to ${neighbor_host}"
+                    break
+                else
+                    sleep 2
+                fi
+            done
         fi
     done
 

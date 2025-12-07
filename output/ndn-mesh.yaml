@@ -1,3 +1,7 @@
+
+---
+
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -491,17 +495,30 @@ data:
     mkdir -p /run/nfd
     export HOME=/root
 
-    # 自己署名証明書の作成 (Router用)
-    # ※ NLSR設定内の router prefix と一致させる必要がある
-    NETWORK_PREFIX="/ndn/jp/waseda"
-    SITE_NAME="sim-site"
-    FULL_PREFIX="${NETWORK_PREFIX}/${SITE_NAME}"
-    ROUTER_PREFIX="${FULL_PREFIX}/%C1.Router/${NODE_NAME}"
+    if [ "$SECURITY_MODE" == "strict" ]; then
+        echo "--- [Strict] Importing Identity from Secret ---"
+        if [ ! -f /etc/secret/identity.p12 ]; then
+            echo "Error: Identity file not found. Setup Job might be running."
+            exit 1
+        fi
+        ndnsec import -P password /etc/secret/identity.p12
 
-    echo "Generating Keys for: ${ROUTER_PREFIX}"
-    ndnsec key-gen "${ROUTER_PREFIX}" | ndnsec cert-install -
-    ndnsec set-default "${ROUTER_PREFIX}"
-    ndnsec cert-dump -i "${ROUTER_PREFIX}" > /etc/nlsr/router.cert
+        NETWORK_PREFIX="/ndn/jp/waseda"
+        SITE_NAME="sim-site"
+        ROUTER_PREFIX="${NETWORK_PREFIX}/${SITE_NAME}/%C1.Router/${NODE_NAME}"
+        ndnsec set-default "$ROUTER_PREFIX"
+        ndnsec cert-dump -i "$ROUTER_PREFIX" > /etc/nlsr/router.cert
+
+    else
+        echo "--- [Lax] Generating Self-Signed Identity ---"
+        NETWORK_PREFIX="/ndn/jp/waseda"
+        SITE_NAME="sim-site"
+        ROUTER_PREFIX="${NETWORK_PREFIX}/${SITE_NAME}/%C1.Router/${NODE_NAME}"
+
+        ndnsec key-gen "$ROUTER_PREFIX" | ndnsec cert-install -
+        ndnsec set-default "$ROUTER_PREFIX"
+        ndnsec cert-dump -i "$ROUTER_PREFIX" > /etc/nlsr/router.cert
+    fi
 
     echo "--- Starting NFD ---"
     nfd-start > /var/log/nfd.log 2>&1 &
@@ -513,8 +530,15 @@ data:
     for neighbor_pair in "${ADDR[@]}"; do
         neighbor_host="${neighbor_pair%%:*}"
         if [ ! -z "$neighbor_host" ]; then
-            echo "Creating face to ${neighbor_host}..."
-            nfdc face create tcp://${neighbor_host} || true
+            echo "Attempting to connect to ${neighbor_host}..."
+            for i in {1..15}; do
+                if nfdc face create tcp://${neighbor_host}; then
+                    echo "Success: Connected to ${neighbor_host}"
+                    break
+                else
+                    sleep 2
+                fi
+            done
         fi
     done
 
@@ -536,34 +560,35 @@ data:
       network /ndn/jp/waseda
       site sim-site
       router /%C1.Router/node-a
-      log-level INFO
+
       lsa-refresh-time 1800
       lsa-interest-lifetime 4
       sync-protocol psync
       sync-interest-lifetime 60000
-      state-dir /var/lib/nlsr/
+      state-dir       /var/lib/nlsr
     }
 
     neighbors
     {
-      hello-retries 3
-      hello-timeout 1
-      hello-interval 60
+       hello-retries 3
+       hello-timeout 1
+       hello-interval  60
       adj-lsa-build-interval 10
+
       face-dataset-fetch-tries 3
       face-dataset-fetch-interval 3600
 
       neighbor
       {
         name /ndn/jp/waseda/sim-site/%C1.Router/node-b
-        face-uri tcp://node-b
+        face-uri "tcp://node-b"
         link-cost 10
       }
 
       neighbor
       {
         name /ndn/jp/waseda/sim-site/%C1.Router/node-c
-        face-uri tcp://node-c
+        face-uri "tcp://node-c"
         link-cost 25
       }
 
@@ -576,6 +601,12 @@ data:
       angle    1.45,2.36
     }
 
+    fib
+    {
+      max-faces-per-prefix 3
+      routing-calc-interval 15
+    }
+
     advertising
     {
       prefix /ndn/jp/waseda/sim-site/node-a
@@ -585,18 +616,191 @@ data:
     {
       validator
       {
+        rule
+        {
+          id "NLSR Hello Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr><INFO>]*<nlsr><INFO><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><nlsr>]*)<nlsr><KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<nlsr><INFO>]*)<nlsr><INFO><><>$
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR LSA Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr><LSA>]*<nlsr><LSA>
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><nlsr>]*)<nlsr><KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                ; the last four components in the prefix should be <lsaType><seqNo><version><segmentNo>
+                p-regex ^<localhop>([^<nlsr><LSA>]*)<nlsr><LSA>(<>*)<><><><>$
+                p-expand \\1\\2
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR datasets"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr>]*<nlsr>[<lsdb><routing-table>]
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY>]*)<KEY><>{1,3}$ ; router key or certificate
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<nlsr>]*)<nlsr>[<lsdb><routing-table>]
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchy Exception Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY><%C1.Router>]*<%C1.Router>[^<KEY><nlsr>]*<KEY><><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><%C1.Operator>]*)<%C1.Operator>[^<KEY>]*<KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<KEY><%C1.Router>]*)<%C1.Router>[^<KEY>]*<KEY><><><>$
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchical Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY>]*<KEY><><><>$
+          }
+          checker
+          {
+            type hierarchical
+            sig-type ecdsa-sha256
+          }
+        }
+
         trust-anchor
         {
+          
           type any
+          
         }
       }
+
       prefix-update-validator
       {
+        rule
+        {
+          id "NLSR ControlCommand Rule"
+          for interest
+          filter
+          {
+            type name
+            regex ^<localhost><nlsr><prefix-update>[<advertise><withdraw>]<><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              regex ^([^<KEY><%C1.Operator>]*)<%C1.Operator>[^<KEY>]*<KEY><>{1,3}$
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchy Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY>]*<KEY><><><>$
+          }
+          checker
+          {
+            type hierarchical
+            sig-type ecdsa-sha256
+          }
+        }
+
         trust-anchor
         {
+          
           type any
+          
         }
       }
+
+      
     }
 ---
 apiVersion: v1
@@ -636,6 +840,8 @@ spec:
               value: "node-a"
             - name: NEIGHBORS
               value: "node-b:10,node-c:25"
+            - name: SECURITY_MODE
+              value: "lax"
           securityContext:
             capabilities:
               add: ["NET_ADMIN"]
@@ -644,6 +850,7 @@ spec:
               mountPath: /scripts
             - name: nlsr-config-vol
               mountPath: /bootstrap/nlsr
+            
       volumes:
         - name: scripts-vol
           configMap:
@@ -652,6 +859,7 @@ spec:
         - name: nlsr-config-vol
           configMap:
             name: config-node-a
+        
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -664,34 +872,35 @@ data:
       network /ndn/jp/waseda
       site sim-site
       router /%C1.Router/node-b
-      log-level INFO
+
       lsa-refresh-time 1800
       lsa-interest-lifetime 4
       sync-protocol psync
       sync-interest-lifetime 60000
-      state-dir /var/lib/nlsr/
+      state-dir       /var/lib/nlsr
     }
 
     neighbors
     {
-      hello-retries 3
-      hello-timeout 1
-      hello-interval 60
+       hello-retries 3
+       hello-timeout 1
+       hello-interval  60
       adj-lsa-build-interval 10
+
       face-dataset-fetch-tries 3
       face-dataset-fetch-interval 3600
 
       neighbor
       {
         name /ndn/jp/waseda/sim-site/%C1.Router/node-a
-        face-uri tcp://node-a
+        face-uri "tcp://node-a"
         link-cost 10
       }
 
       neighbor
       {
         name /ndn/jp/waseda/sim-site/%C1.Router/node-c
-        face-uri tcp://node-c
+        face-uri "tcp://node-c"
         link-cost 15
       }
 
@@ -704,6 +913,12 @@ data:
       angle    1.45,2.36
     }
 
+    fib
+    {
+      max-faces-per-prefix 3
+      routing-calc-interval 15
+    }
+
     advertising
     {
       prefix /ndn/jp/waseda/sim-site/node-b
@@ -713,18 +928,191 @@ data:
     {
       validator
       {
+        rule
+        {
+          id "NLSR Hello Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr><INFO>]*<nlsr><INFO><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><nlsr>]*)<nlsr><KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<nlsr><INFO>]*)<nlsr><INFO><><>$
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR LSA Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr><LSA>]*<nlsr><LSA>
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><nlsr>]*)<nlsr><KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                ; the last four components in the prefix should be <lsaType><seqNo><version><segmentNo>
+                p-regex ^<localhop>([^<nlsr><LSA>]*)<nlsr><LSA>(<>*)<><><><>$
+                p-expand \\1\\2
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR datasets"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr>]*<nlsr>[<lsdb><routing-table>]
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY>]*)<KEY><>{1,3}$ ; router key or certificate
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<nlsr>]*)<nlsr>[<lsdb><routing-table>]
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchy Exception Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY><%C1.Router>]*<%C1.Router>[^<KEY><nlsr>]*<KEY><><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><%C1.Operator>]*)<%C1.Operator>[^<KEY>]*<KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<KEY><%C1.Router>]*)<%C1.Router>[^<KEY>]*<KEY><><><>$
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchical Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY>]*<KEY><><><>$
+          }
+          checker
+          {
+            type hierarchical
+            sig-type ecdsa-sha256
+          }
+        }
+
         trust-anchor
         {
+          
           type any
+          
         }
       }
+
       prefix-update-validator
       {
+        rule
+        {
+          id "NLSR ControlCommand Rule"
+          for interest
+          filter
+          {
+            type name
+            regex ^<localhost><nlsr><prefix-update>[<advertise><withdraw>]<><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              regex ^([^<KEY><%C1.Operator>]*)<%C1.Operator>[^<KEY>]*<KEY><>{1,3}$
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchy Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY>]*<KEY><><><>$
+          }
+          checker
+          {
+            type hierarchical
+            sig-type ecdsa-sha256
+          }
+        }
+
         trust-anchor
         {
+          
           type any
+          
         }
       }
+
+      
     }
 ---
 apiVersion: v1
@@ -764,6 +1152,8 @@ spec:
               value: "node-b"
             - name: NEIGHBORS
               value: "node-a:10,node-c:15"
+            - name: SECURITY_MODE
+              value: "lax"
           securityContext:
             capabilities:
               add: ["NET_ADMIN"]
@@ -772,6 +1162,7 @@ spec:
               mountPath: /scripts
             - name: nlsr-config-vol
               mountPath: /bootstrap/nlsr
+            
       volumes:
         - name: scripts-vol
           configMap:
@@ -780,6 +1171,7 @@ spec:
         - name: nlsr-config-vol
           configMap:
             name: config-node-b
+        
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -792,34 +1184,35 @@ data:
       network /ndn/jp/waseda
       site sim-site
       router /%C1.Router/node-c
-      log-level INFO
+
       lsa-refresh-time 1800
       lsa-interest-lifetime 4
       sync-protocol psync
       sync-interest-lifetime 60000
-      state-dir /var/lib/nlsr/
+      state-dir       /var/lib/nlsr
     }
 
     neighbors
     {
-      hello-retries 3
-      hello-timeout 1
-      hello-interval 60
+       hello-retries 3
+       hello-timeout 1
+       hello-interval  60
       adj-lsa-build-interval 10
+
       face-dataset-fetch-tries 3
       face-dataset-fetch-interval 3600
 
       neighbor
       {
         name /ndn/jp/waseda/sim-site/%C1.Router/node-a
-        face-uri tcp://node-a
+        face-uri "tcp://node-a"
         link-cost 25
       }
 
       neighbor
       {
         name /ndn/jp/waseda/sim-site/%C1.Router/node-b
-        face-uri tcp://node-b
+        face-uri "tcp://node-b"
         link-cost 15
       }
 
@@ -832,6 +1225,12 @@ data:
       angle    1.45,2.36
     }
 
+    fib
+    {
+      max-faces-per-prefix 3
+      routing-calc-interval 15
+    }
+
     advertising
     {
       prefix /ndn/jp/waseda/sim-site/node-c
@@ -841,18 +1240,191 @@ data:
     {
       validator
       {
+        rule
+        {
+          id "NLSR Hello Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr><INFO>]*<nlsr><INFO><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><nlsr>]*)<nlsr><KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<nlsr><INFO>]*)<nlsr><INFO><><>$
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR LSA Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr><LSA>]*<nlsr><LSA>
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><nlsr>]*)<nlsr><KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                ; the last four components in the prefix should be <lsaType><seqNo><version><segmentNo>
+                p-regex ^<localhop>([^<nlsr><LSA>]*)<nlsr><LSA>(<>*)<><><><>$
+                p-expand \\1\\2
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR datasets"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<nlsr>]*<nlsr>[<lsdb><routing-table>]
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY>]*)<KEY><>{1,3}$ ; router key or certificate
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<nlsr>]*)<nlsr>[<lsdb><routing-table>]
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchy Exception Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY><%C1.Router>]*<%C1.Router>[^<KEY><nlsr>]*<KEY><><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              hyper-relation
+              {
+                k-regex ^([^<KEY><%C1.Operator>]*)<%C1.Operator>[^<KEY>]*<KEY><>{1,3}$
+                k-expand \\1
+                h-relation equal
+                p-regex ^([^<KEY><%C1.Router>]*)<%C1.Router>[^<KEY>]*<KEY><><><>$
+                p-expand \\1
+              }
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchical Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY>]*<KEY><><><>$
+          }
+          checker
+          {
+            type hierarchical
+            sig-type ecdsa-sha256
+          }
+        }
+
         trust-anchor
         {
+          
           type any
+          
         }
       }
+
       prefix-update-validator
       {
+        rule
+        {
+          id "NLSR ControlCommand Rule"
+          for interest
+          filter
+          {
+            type name
+            regex ^<localhost><nlsr><prefix-update>[<advertise><withdraw>]<><><>$
+          }
+          checker
+          {
+            type customized
+            sig-type ecdsa-sha256
+            key-locator
+            {
+              type name
+              regex ^([^<KEY><%C1.Operator>]*)<%C1.Operator>[^<KEY>]*<KEY><>{1,3}$
+            }
+          }
+        }
+
+        rule
+        {
+          id "NLSR Hierarchy Rule"
+          for data
+          filter
+          {
+            type name
+            regex ^[^<KEY>]*<KEY><><><>$
+          }
+          checker
+          {
+            type hierarchical
+            sig-type ecdsa-sha256
+          }
+        }
+
         trust-anchor
         {
+          
           type any
+          
         }
       }
+
+      
     }
 ---
 apiVersion: v1
@@ -892,6 +1464,8 @@ spec:
               value: "node-c"
             - name: NEIGHBORS
               value: "node-a:25,node-b:15"
+            - name: SECURITY_MODE
+              value: "lax"
           securityContext:
             capabilities:
               add: ["NET_ADMIN"]
@@ -900,6 +1474,7 @@ spec:
               mountPath: /scripts
             - name: nlsr-config-vol
               mountPath: /bootstrap/nlsr
+            
       volumes:
         - name: scripts-vol
           configMap:
@@ -908,3 +1483,4 @@ spec:
         - name: nlsr-config-vol
           configMap:
             name: config-node-c
+        

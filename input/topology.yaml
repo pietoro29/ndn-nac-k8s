@@ -3,6 +3,7 @@ site_name: "sim-site"
 
 nodes:
   - name: "node-a"
+    role: "gateway"  #Root/Site/Opの証明書をpublishするノード
     neighbors:
       - name: "node-b"
         cost: 10
@@ -22,3 +23,6 @@ nodes:
         cost: 25
       - name: "node-b"
         cost: 15
+
+security:
+    mode: "lax"  # "strict" or "lax"

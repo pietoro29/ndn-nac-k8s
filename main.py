@@ -13,8 +13,19 @@ def load_config(filepath):
 
 def generate_manifests(config):
     env = Environment(loader=FileSystemLoader(TEMPLATE_DIR))
-
     manifests = []
+
+    rbac_template = env.get_template('rbac.j2')
+    manifests.append(rbac_template.render(config=config, security=config.get('security', {})))
+
+    setup_job_template = env.get_template('setup-job.j2')
+    manifests.append(setup_job_template.render(
+        config=config,
+        security=config.get('security', {}),
+        nodes=config['nodes'],
+        network_prefix=config['network_prefix'],
+        site_name=config['site_name']
+    ))
 
     nfd_conf_template = env.get_template('nfd.conf.j2')
     nfd_conf_content = nfd_conf_template.render()
@@ -29,16 +40,19 @@ def generate_manifests(config):
     nlsr_conf_template = env.get_template('nlsr.conf.j2')
     for node in config['nodes']:
         nlsr_conf_content = nlsr_conf_template.render(
+            node=node,
             node_name=node['name'],
             neighbors=node['neighbors'],
             network_prefix=config['network_prefix'],
-            site_name=config['site_name']
+            site_name=config['site_name'],
+            security=config.get('security', {})
         )
         rendered = node_deployment_template.render(
             node=node,
             network_prefix=config['network_prefix'],
             site_name=config['site_name'],
-            nlsr_conf=nlsr_conf_content
+            nlsr_conf=nlsr_conf_content,
+            security=config.get('security', {})
         )
         manifests.append(rendered)
 

@@ -43,6 +43,8 @@ spec:
               value: "{{ node.name }}"
             - name: NEIGHBORS
               value: "{% for n in node.neighbors %}{{ n.name }}:{{ n.cost }}{{ ',' if not loop.last }}{% endfor %}"
+            - name: SECURITY_MODE
+              value: "{{ security.mode }}"
           securityContext:
             capabilities:
               add: ["NET_ADMIN"]
@@ -51,6 +53,14 @@ spec:
               mountPath: /scripts
             - name: nlsr-config-vol
               mountPath: /bootstrap/nlsr
+            {% if security.mode == 'strict' %}
+            - name: secret-vol
+              mountPath: /etc/secret
+              readOnly: true
+            - name: trust-anchor-vol
+              mountPath: /etc/trust-anchor
+              readOnly: true
+            {% endif %}
       volumes:
         - name: scripts-vol
           configMap:
@@ -59,3 +69,11 @@ spec:
         - name: nlsr-config-vol
           configMap:
             name: config-{{ node.name }}
+        {% if security.mode == 'strict' %}
+        - name: secret-vol
+          secret:
+            secretName: sec-{{ node.name }}
+        - name: trust-anchor-vol
+          secret:
+            secretName: ndn-trust-anchor
+        {% endif %}
