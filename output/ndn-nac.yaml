@@ -1,0 +1,695 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nac-installer-sa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nac-installer-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nac-installer-binding
+subjects:
+- kind: ServiceAccount
+  name: nac-installer-sa
+roleRef:
+  kind: Role
+  name: nac-installer-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nac-source-code
+data:
+
+  kdk-server.cpp: |
+    #include <ndn-cxx/face.hpp>
+    #include <ndn-cxx/security/key-chain.hpp>
+    #include <ndn-cxx/util/io.hpp>
+    #include <iostream>
+    #include <filesystem>
+    #include <map>
+
+    namespace fs = std::filesystem;
+
+    namespace ndn::nac::server {
+
+    class KdkServer
+    {
+    public:
+      KdkServer()
+        : m_face(nullptr, m_keyChain)
+      {
+        loadDataFiles("/data/nac-data");
+      }
+
+      void run()
+      {
+        if (m_store.empty()) {
+          std::cerr << "WARN: No data loaded. Server is idle." << std::endl;
+        } else {
+          std::cout << "KDK Server running. Serving " << m_store.size() << " data packets." << std::endl;
+        }
+        m_face.processEvents();
+      }
+
+    private:
+      void loadDataFiles(const std::string& pathStr)
+      {
+        fs::path dir(pathStr);
+        if (!fs::exists(dir) || !fs::is_directory(dir)) {
+          std::cerr << "Error: Directory not found: " << pathStr << std::endl;
+          return;
+        }
+
+        for (const auto& entry : fs::directory_iterator(dir)) {
+          if (entry.path().extension() == ".data") {
+            try {
+              auto data = ndn::io::load<Data>(entry.path().string());
+              if (data) {
+                storeData(data);
+              }
+            }
+            catch (const std::exception& e) {
+              std::cerr << "Failed to load " << entry.path() << ": " << e.what() << std::endl;
+            }
+          }
+        }
+      }
+
+      void storeData(std::shared_ptr<Data> data)
+      {
+        Name name = data->getName();
+        m_store[name] = data;
+
+        std::cout << "Loaded: " << name << std::endl;
+
+        Name prefixToServe = name;
+        //名前から"KDK"を探してそこまでの長さで切る
+        for (ssize_t i = 0; i < static_cast<ssize_t>(name.size()); ++i) {
+          if (name[i].toUri() == "KDK") {
+            prefixToServe = name.getPrefix(i + 1); // .../NAC/KDK までを含む
+            break;
+          }
+        }
+
+        std::cout << "[KDK Server] Registering filter: " << prefixToServe << std::endl;
+
+        m_face.setInterestFilter(prefixToServe,
+          [this, data](const InterestFilter&, const Interest& interest) {
+            // InterestがData名の一部(Prefix)であるか、あるいはDataがInterestにマッチするか
+            if (data->getName().isPrefixOf(interest.getName()) || interest.matchesData(*data)){
+              std::cout << "[KDK Server] Serving: " << data->getName() << std::endl;
+              m_face.put(*data);
+            }
+          },
+          [](const Name& prefix, const std::string& msg) {
+            std::cerr << "Register failed for " << prefix << ": " << msg << std::endl;
+          }
+        );
+      }
+
+    private:
+      KeyChain m_keyChain;
+      Face m_face;
+      std::map<Name, std::shared_ptr<Data>> m_store;
+    };
+
+    } // namespace
+
+    int main(int argc, char** argv)
+    {
+      try {
+        ndn::nac::server::KdkServer server;
+        server.run();
+      }
+      catch (const std::exception& e) {
+        std::cerr << "FATAL: " << e.what() << std::endl;
+        return 1;
+      }
+      return 0;
+    }
+
+
+  Makefile: |
+    CXX = g++
+    CXXFLAGS = -std=c++17 -Wall -o2 $(shell pkg-config --cflags libndn-cxx libndn-nac)
+    LDFLAGS = $(shell pkg-config --libs libndn-cxx libndn-nac)
+
+    TARGETS = consumer producer kdk-server
+    all: $(TARGETS)
+
+    consumer: consumer.o
+    	$(CXX) -o $@ $^ $(LDFLAGS)
+
+    producer: producer.o
+    	$(CXX) -o $@ $^ $(LDFLAGS)
+
+    kdk-server: kdk-server.o
+    	$(CXX) -o $@ $^ $(LDFLAGS)
+
+    %.o: %.cpp nac-utils.hpp
+    	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+    clean:
+    	rm -f *.o $(TARGETS)
+
+    .PHONY: all clean
+
+
+  consumer.cpp: |
+    #include <ndn-cxx/face.hpp>
+    #include <ndn-cxx/security/key-chain.hpp>
+    #include <ndn-cxx/security/validator-config.hpp>
+    #include <ndn-cxx/util/io.hpp>
+    #include <ndn-nac/decryptor.hpp>
+    #include <ndn-cxx/security/pib/identity.hpp>
+    #include "nac-utils.hpp"
+
+    #include <iostream>
+    #include <filesystem>
+    #include <cstdlib>
+
+    namespace fs = std::filesystem;
+
+    namespace ndn::nac::examples {
+
+    class Consumer
+    {
+    public:
+        Consumer()
+            : m_face(nullptr, m_keyChain)
+            , m_validator(m_face)
+        {
+            const char* prefixEnv = std::getenv("NDN_DATA_PREFIX");
+            if (!prefixEnv) {
+                throw std::runtime_error("NDN_DATA_PREFIX environment variable not set");
+            }
+            m_dataPrefix = Name(prefixEnv);
+
+            m_validator.load(R"CONF(trust-anchor { type any })CONF", "fake-config");
+        }
+
+        void run()
+        {
+            //KDKのロード
+            std::string kdkPath = findKeyFile("/data/nac-data", "kdk_");
+            if (!kdkPath.empty()) {
+                std::cout << "[Consumer] Found local KDK cache: " << kdkPath << std::endl;
+                auto kdkData = ndn::io::load<Data>(kdkPath);
+                if (kdkData) {
+                    initializeDecryptor(kdkData);
+                    sendContentInterest();
+                    m_face.processEvents();
+                    return;
+                }
+            }
+
+            //ローカルになければネットワークへ取りに行く
+            std::cout << "[Consumer] No local KDK. Fetching from network..." << std::endl;
+            fetchKdk();
+
+            m_face.processEvents();
+        }
+
+    private:
+      // KDKをネットワークから取得する
+        void fetchKdk() {
+            // KDKの命名規則は /<ContentPrefix>/NAC/KDK/<KEK-ID>/...
+            // KEK-IDが不明なため、/<ContentPrefix>/NAC/KDK までを指定して CanBePrefix で投げる
+            Name kdkQuery = m_dataPrefix;
+            kdkQuery.append("NAC").append("KDK");
+
+            Interest interest(kdkQuery);
+            interest.setCanBePrefix(true); // 具体的なIDが不明なためPrefixで検索
+            interest.setMustBeFresh(true);
+
+            std::cout << "=== Fetching KDK: " << interest.getName() << " ===" << std::endl;
+
+            m_face.expressInterest(interest,
+                  std::bind(&Consumer::onKdkData, this, std::placeholders::_1, std::placeholders::_2),
+                std::bind(&Consumer::onNack, this, std::placeholders::_1, std::placeholders::_2),
+                std::bind(&Consumer::onTimeout, this, std::placeholders::_1)
+            );
+        }
+
+      // KDK受信時のコールバック
+        void onKdkData(const Interest&, const Data& data) {
+            std::cout << "Received KDK Data: " << data.getName() << std::endl;
+            auto kdkData = std::make_shared<Data>(data);
+
+            try {
+                  initializeDecryptor(kdkData);
+                //本来のコンテンツを取りに行く
+                sendContentInterest();
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to initialize Decryptor with fetched KDK: " << e.what() << std::endl;
+                exit(1);
+            }
+        }
+
+      // Decryptorの初期化
+        void initializeDecryptor(std::shared_ptr<Data> kdkData) {
+            m_kdkData = kdkData;
+
+            ndn::security::pib::Identity myIdentity;
+            try {
+                myIdentity = m_keyChain.getPib().getDefaultIdentity();
+            } catch (const std::exception& e) {
+                std::cerr << "FATAL: No default identity found. " << e.what() << std::endl;
+                exit(1);
+            }
+
+            std::cout << "Initializing Decryptor with Identity: " << myIdentity.getName() << std::endl;
+
+            // Decryptor作成
+            m_decryptor = std::make_unique<Decryptor>(
+                myIdentity.getDefaultKey(), // KDKは自分のKeyで暗号化されている
+                m_validator,
+                m_keyChain,
+                m_face
+            );
+
+            // KDK配信登録
+            Name kdkName = m_kdkData->getName();
+            // 名前の中に "ENCRYPTED-BY" が含まれているか確認して登録範囲を決める
+            // 簡易的にData名のPrefix(-1)で登録
+            m_kdkHandle = m_face.setInterestFilter(
+                kdkName.getPrefix(-1),
+                [this](const InterestFilter&, const Interest& interest) {
+                    if (interest.matchesData(*m_kdkData)) {
+                        // std::cout << "Serving KDK to self" << std::endl;
+                        m_face.put(*m_kdkData);
+                    }
+                }
+            );
+        }
+
+
+        // コンテンツ取得リクエスト
+        void sendContentInterest() {
+            Interest interest(m_dataPrefix);
+            interest.setCanBePrefix(true);
+            interest.setMustBeFresh(true);
+            std::cout << "=== Consumer Sending Interest: " << interest << " ===" << std::endl;
+
+            m_face.expressInterest(interest,
+                std::bind(&Consumer::onData, this, std::placeholders::_1, std::placeholders::_2),
+                std::bind(&Consumer::onNack, this, std::placeholders::_1, std::placeholders::_2),
+                std::bind(&Consumer::onTimeout, this, std::placeholders::_1)
+            );
+        }
+
+        void onData(const Interest&, const Data& data) {
+            std::cout << "Received Content Data. Decrypting..." << std::endl;
+
+            if (!m_decryptor) return;
+
+            Block contentBlock = data.getContent();
+            contentBlock.parse();
+
+            try{
+                Block encryptedContent = contentBlock.blockFromValue();
+                m_decryptor->decrypt(encryptedContent,
+                    [](const ConstBufferPtr& c) {
+                        std::cout << "\n*** SUCCESS! Decrypted: "
+                                  << std::string(reinterpret_cast<const char*>(c->data()), c->size())
+                                  << " ***\n" << std::endl;
+                        exit(0);
+                    },
+                    [](const ErrorCode& c, const std::string& e) {
+                        std::cerr << "Decryption Failed [" << static_cast<int>(c) << "]: " << e << std::endl;
+                        exit(1);
+                    }
+                );
+            } catch (const std::exception& e) {
+                std::cerr << "Parse Error: " << e.what() << std::endl;
+            }
+        }
+
+        void onNack(const Interest& interest, const lp::Nack& nack) const {
+            std::cerr << "Nack for " << interest.getName() << ": " << nack.getReason() << std::endl;
+            exit(1);
+        }
+
+        void onTimeout(const Interest& interest) const {
+            std::cerr << "Timeout for " << interest.getName() << std::endl;
+            exit(1);
+        }
+
+        KeyChain m_keyChain;
+        Face m_face;
+        ValidatorConfig m_validator;
+        std::unique_ptr<Decryptor> m_decryptor;
+        std::shared_ptr<Data> m_kdkData;
+        ScopedInterestFilterHandle m_kdkHandle;
+        Name m_dataPrefix;
+    };
+
+    } // namespace
+
+    int main() {
+        try {
+            ndn::nac::examples::Consumer c;
+            c.run();
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << std::endl;
+            return 1;
+        }
+    }
+
+
+  nac-utils.hpp: |
+    #ifndef NAC_UTILS_HPP
+    #define NAC_UTILS_HPP
+    #include <ndn-cxx/util/io.hpp>
+    #include <ndn-cxx/face.hpp>
+    #include <filesystem>
+    #include <vector>
+    #include <string>
+    #include <iostream>
+
+    namespace fs = std::filesystem;
+
+    namespace ndn::nac::examples {
+
+    // 指定ディレクトリからkek_ or kdk_で始まるDataファイルを探す
+    std::string findKeyFile(const std::string& directory, const std::string& filePrefix) {
+        for (const auto& entry : fs::directory_iterator(directory)) {
+            std::string filename = entry.path().filename().string();
+            if (filename.rfind(filePrefix, 0) == 0 && filename.substr(filename.length() - 5) == ".data") {
+                return entry.path().string();
+            }
+        }
+        return "";
+    }
+
+    // ローカルファイルからロードしたDataをFace経由で取得できるように配信
+    void serveLocalData(Face& face, std::shared_ptr<Data> data) {
+        if (!data) return;
+
+        face.setInterestFilter(
+            data->getName().getPrefix(-1),
+            [data](const InterestFilter&, const Interest& interest){
+                if (interest.matchesData(*data)) {
+
+                }
+            },
+            nullptr
+        );
+    }
+    } // namespace ndn::nac::examples
+    #endif
+
+
+  producer.cpp: |
+    #include <ndn-cxx/face.hpp>
+    #include <ndn-cxx/security/key-chain.hpp>
+    #include <ndn-cxx/security/validator-config.hpp>
+    #include <ndn-cxx/util/io.hpp>
+    #include <ndn-nac/encryptor.hpp>
+
+    #include "nac-utils.hpp"
+
+    #include <iostream>
+    #include <filesystem>
+    #include <thread>
+    #include <chrono>
+
+    namespace fs = std::filesystem;
+
+    namespace ndn::nac::examples {
+
+    class Producer
+    {
+    public:
+      Producer()
+        : m_face(nullptr, m_keyChain)
+        , m_validator(m_face)
+      {
+        const char* prefixEnv = std::getenv("NDN_DATA_PREFIX");
+        if (!prefixEnv){
+            throw std::runtime_error("NDN_DATA_PREFIX environment variable not set");
+        }
+        m_dataPrefix = Name(prefixEnv);
+
+        // バリデータ (テスト用: 全許可)
+        m_validator.load(R"CONF(trust-anchor { type any })CONF", "fake-config");
+
+        //KEKのロード
+        std::string kekPath = findKeyFile("/data/nac-data", "kek_");
+        if (kekPath.empty()) {
+            throw std::runtime_error("No KEK file (kek_*.data) found in /data/nac-data/");
+        }
+
+        m_kekData = ndn::io::load<Data>(kekPath);
+        if (!m_kekData) throw std::runtime_error("Failed to parse KEK data");
+
+        std::cout << "Loaded KEK: " << m_kekData->getName() << std::endl;
+
+        //KEK配信の登録
+        m_kekHandle = m_face.setInterestFilter(
+            m_kekData->getName().getPrefix(-1), // /ndn/AM/.../KEK で待ち受け
+            [this](const InterestFilter&, const Interest& interest) {
+                if (interest.matchesData(*m_kekData)) {
+                        m_face.put(*m_kekData);
+                }
+            }
+        );
+
+        //Encryptor 初期化
+        // KEKの名前からAccessPrefixを導出
+        Name accessPrefix = m_kekData->getName().getPrefix(-2);
+        auto myIdentity = m_keyChain.getPib().getDefaultIdentity();
+        m_encryptor = std::make_unique<Encryptor>(
+            accessPrefix,
+            accessPrefix, //CK Prefix
+            ndn::security::SigningInfo(myIdentity),
+            [](const ErrorCode& code, const std::string& msg) {
+                std::cerr << "NAC Encryption Error: " << msg << std::endl;
+            },
+            m_validator,
+            m_keyChain,
+            m_face
+        );
+      }
+
+      void run()
+      {
+        std::cout << "=== Producer Ready  for" << m_dataPrefix << " ===" << std::endl;
+
+        // データ要求に対するフィルタ登録
+        m_face.setInterestFilter(
+            InterestFilter(m_dataPrefix),
+            std::bind(&Producer::onContentInterest, this, std::placeholders::_2),
+            [](const Name& prefix) { std::cout << "Registered prefix: " << prefix << std::endl; },
+            [](const Name&, const std::string& msg) { std::cerr << "Register failed: " << msg << std::endl; }
+        );
+        m_face.processEvents();
+      }
+
+    private:
+      void onContentInterest(const Interest& interest) {
+        std::cout << "<< Interest: " << interest.getName() << std::endl;
+        std::string content = "Secure Video Data at " + std::to_string(std::time(nullptr));
+
+        try{
+            //contentを暗号化
+            auto encrypted = m_encryptor->encrypt({reinterpret_cast<const uint8_t*>(content.data()), content.size()});
+            //Dataパケットを作る
+            auto data = std::make_shared<Data>(interest.getName());
+            data->setFreshnessPeriod(1_s);
+            data->setContent(encrypted.wireEncode());
+            //署名
+            m_keyChain.sign(*data);
+            m_face.put(*data);
+            std::cout << ">> Sent Encrypted Data (" << content.size() << " bytes)" << std::endl;
+        } catch (const std::exception& e){
+            std::cerr << "Encryption/Signing Error: " << e.what() << std::endl;
+        }
+      }
+
+      KeyChain m_keyChain;
+      Face m_face;
+      ValidatorConfig m_validator;
+      std::shared_ptr<Data> m_kekData;
+      ScopedInterestFilterHandle m_kekHandle;
+      std::unique_ptr<Encryptor> m_encryptor;
+      Name m_dataPrefix;
+    };
+
+    } // namespace
+
+    int main() {
+      try {
+        ndn::nac::examples::Producer producer;
+        producer.run();
+      } catch (const std::exception& e) {
+        std::cerr << "Fatal: " << e.what() << std::endl;
+        return 1;
+      }
+    }
+
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nac-orchestrator
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      serviceAccountName: nac-installer-sa
+      containers:
+      - name: orchestrator
+        image: bitnami/kubectl:latest
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "=== Starting NAC Orchestration ==="
+          NETWORK_PREFIX="/ndn/jp/waseda"
+          SITE_NAME="sim-site"
+
+          get_pod() {
+            kubectl get pod -l app=$1 -o jsonpath="{.items[0].metadata.name}"
+          }
+
+          run_on() {
+            local node=$1
+            local cmd=$2
+            local pod=$(get_pod $node)
+            echo "[$node] Executing: $cmd"
+            kubectl exec $pod -- /bin/bash -c "$cmd"
+          }
+
+          copy_from_pod() {
+            local node=$1
+            local src=$2
+            local dest=$3
+            local pod=$(get_pod $node)
+            echo "[$node] Copying FROM: $src -> Local: $dest"
+            kubectl exec $pod -- cat $src > $dest
+          }
+
+          copy_to_pod() {
+            local node=$1
+            local src=$2
+            local dest=$3
+            local pod=$(get_pod $node)
+            echo "[$node] Copying TO: $dest <- Local: $src"
+            kubectl exec $pod -- mkdir -p $(dirname $dest)
+            cat $src | kubectl exec -i $pod -- /bin/bash -c "cat > $dest"
+          }
+
+          setup_node_env() {
+            local node=$1
+            local pod=$(get_pod $node)
+            echo "Setting up environment for $node..."
+
+            kubectl exec $pod -- mkdir -p /root/nac /data/nac-data
+            for file_path in /src-mount/*; do
+                filename=$(basename "$file_path")
+                if [ "$filename" == "*" ]; then continue; fi
+                copy_to_pod $node "$file_path" "/root/nac/$filename"
+            done
+            kubectl exec $pod -- /bin/bash -c "cd /root/nac && make -j2"
+          }
+
+          echo ">>> Phase 1: Deploying Source Codes & Compiling..."
+          ALL_NODES=("node-a" "node-b" "node-c" )
+
+          for node in "${ALL_NODES[@]}"; do
+            setup_node_env $node
+          done
+
+
+          echo ">>> Phase 2: Generating Keys & Policies..."
+          
+          AM_NODE="node-b"
+          AM_ID_NAME="$NETWORK_PREFIX/$SITE_NAME/$AM_NODE"
+
+          run_on $AM_NODE "mkdir -p /data/nac-data"
+
+          echo "    Ensuring Identity $AM_ID_NAME exists on $AM_NODE..."
+          run_on $AM_NODE "ndnsec key-gen -t r $AM_ID_NAME | ndnsec cert-install -"
+
+          echo "--- Configuring Policy managed by AM: $AM_NODE ---"
+          
+          CONTENT_PREFIX="/ndn/jp/waseda/sim-site/node-b/homepage/index.html"
+          #PrefixからMD5ハッシュ(先頭8文字)を生成
+          PREFIX_HASH=$(echo -n "$CONTENT_PREFIX" | md5sum | awk '{print $1}' | cut -c1-8)
+          KEK_FILE="kek_${PREFIX_HASH}.data"
+          echo "  > Target Content: $CONTENT_PREFIX (Hash: $PREFIX_HASH)"
+
+          echo "    Generating KEK -> $KEK_FILE"
+          run_on $AM_NODE "ndn-nac dump-kek -i $AM_ID_NAME -d $CONTENT_PREFIX > /data/nac-data/$KEK_FILE"
+
+          
+          CONS_NODE="node-c"
+          CONS_ID_NAME="$NETWORK_PREFIX/$SITE_NAME/$CONS_NODE"
+
+          KDK_FILE="kdk_${PREFIX_HASH}_${CONS_NODE}.data"
+          echo "    >> Processing Consumer: $CONS_NODE"
+
+          run_on $CONS_NODE "mkdir -p /root/nac /data/nac-data"
+
+          run_on $CONS_NODE "ndnsec key-gen -t r $CONS_ID_NAME | ndnsec cert-install -"
+          run_on $CONS_NODE "ndnsec cert-dump -i $CONS_ID_NAME > /root/nac/my_cert.data"
+
+          copy_from_pod $CONS_NODE /root/nac/my_cert.data /tmp/${CONS_NODE}.cert
+          copy_to_pod $AM_NODE /tmp/${CONS_NODE}.cert /root/nac/${CONS_NODE}.cert
+
+          echo "       Generating KDK (add-member)..."
+          run_on $AM_NODE "ndn-nac add-member -i $AM_ID_NAME -d $CONTENT_PREFIX -m /root/nac/${CONS_NODE}.cert -o /root/nac/$KDK_FILE"
+          run_on $AM_NODE "cp /root/nac/$KDK_FILE /data/nac-data/"
+
+           # End Consumers
+           # End Data Contents
+           # End Policies
+
+          #echo ">>> Phase 3: Launching Applications..."
+
+          #
+          #AM_NODE="node-b"
+          #echo "Starting KDK Server on $AM_NODE"
+          #run_on $AM_NODE "nohup /root/nac/kdk-server > /root/nac/kdk-server.log 2>&1 &"
+
+          #
+          #CONTENT_PREFIX="/ndn/jp/waseda/sim-site/node-b/homepage/index.html"
+
+          # Producer (AMノード)
+          #echo "Starting Producer on $AM_NODE for $CONTENT_PREFIX"
+          #run_on $AM_NODE "export NDN_DATA_PREFIX=$CONTENT_PREFIX; nohup /root/nac/producer > /root/nac/producer.log 2>&1 &"
+
+          #
+          #CONS_NODE="node-c"
+          #echo "Starting Consumer on $CONS_NODE for $CONTENT_PREFIX"
+          #run_on $CONS_NODE "export NDN_DATA_PREFIX=$CONTENT_PREFIX; nohup /root/nac/consumer > /root/nac/consumer.log 2>&1 &"
+          #
+
+          
+          
+
+          echo "=== NAC Orchestration Complete ==="
+          exit 0
+
+        volumeMounts:
+        - name: src-vol
+          mountPath: /src-mount
+      volumes:
+      - name: src-vol
+        configMap:
+          name: nac-source-code
+
+      restartPolicy: Never
+

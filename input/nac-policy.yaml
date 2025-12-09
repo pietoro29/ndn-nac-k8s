@@ -1,0 +1,10 @@
+policies:
+  - am_node: "node-b"
+    data_contents:
+      - prefix: "/ndn/jp/waseda/sim-site/node-b/homepage/index.html"
+        allowed_consumers:
+          - "node-c"
+
+      # 例: 別のデータがあればここに追加
+      # - prefix: "/ndn/jp/waseda/sim-site/node-b/..."
+      #   allowed_consumers: ["node-a", "node-c"]

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nac-source-code
+data:
+{% for filename, content in sources.items() %}
+  {{ filename }}: |
+    {{ content | indent(4) }}
+{% endfor %}
