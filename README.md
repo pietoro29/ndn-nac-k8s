@@ -117,6 +117,7 @@ kubectl delete -f output/ndn-nac.yaml
 kubectl delete -f output/ndn-mesh.yaml
 ```
 
-
-
-
+## ライセンス
+```bash
+このプログラムはGNU General Public License v3.0 (GPLv3) の下でライセンスされています。詳細は [LICENSE](LICENSE) ファイルをご確認ください。
+```
