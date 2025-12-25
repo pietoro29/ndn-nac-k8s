@@ -1,6 +1,7 @@
 # NDN-NAC Kubernetes Simulator
 
 Kubernetes上でNDN (Named Data Networking) のメッシュネットワークと、NAC (Name-Based Access Control) をシミュレートするための環境構築ツールです
+
 PythonとJinja2テンプレートを使用してKubernetesマニフェストを動的に生成し、NLSRによるルーティングや、証明書チェーンを用いたセキュアな通信、およびNACによるコンテンツアクセスコントロールの実験を行うことができます
 
 ## 全体の流れ
@@ -115,4 +116,5 @@ Phase1で構築したネットワーク上にNACコンポーネントをデプ�
 kubectl delete -f output/ndn-nac.yaml
 kubectl delete -f output/ndn-mesh.yaml
 ```
+
 
